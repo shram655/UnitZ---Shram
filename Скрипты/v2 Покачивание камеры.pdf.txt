@@ -1,0 +1,364 @@
+using System.Collections;
+using System.Collections.Generic;
+using UnityEngine;
+using UnityEngine.UI;
+using Photon.Pun;
+using TMPro;
+
+public class Move_Player : MonoBehaviour
+{
+    PhotonView view;
+    public TextMeshPro nick;
+
+    [Header("Управление камерой")]
+    private float xRotation;
+    private float sensitivity = 50f;
+    private float sensMultiplier = 1f;
+    public Camera cam;
+
+    [Header("Прыжок и гравитация")]
+    public float jumpSpeed = 8.0F;
+    public float gravity = 20.0F;
+    private Vector3 moveDirection = Vector3.zero;
+
+    public Vector3 playerScale;
+
+    [Header("Скорость перемещения персонажа")]
+    public float baseSpeed = 7f;
+    public float runSpeed = 15f;
+    private float currentSpeed;
+
+    [Header("Спавн и дестрой объектов.")]
+    public GameObject Prefab;
+    public GameObject aim;
+    Ray spawnRay;
+    RaycastHit hit;
+
+    [Header("Инвентарь")]
+    public GameObject[] blocks;
+    public GameObject[] cellPanels;
+    public int numPanels;
+    public GameObject Torch;
+    public GameObject Canvas;
+
+    [Header("Звуки")]
+    public AudioClip[] sound;
+    public AudioSource music;
+
+    // --- ПЕРЕМЕННЫЕ ДЛЯ РАЗРУШЕНИЯ ---
+    private bool isBreaking = false;
+    private GameObject targetToBreak = null;
+    private float breakTimer = 0f;
+    public float breakTime = 1.0f;
+    public float breakSoundInterval = 0.3f;
+    private float nextSoundTime = 0f;
+
+    // --- МЯГКАЯ ТРЯСКА КАМЕРЫ (ЕЩЁ В 2 РАЗА СЛАБЕЕ) ---
+    [Tooltip("Сила тряски. Сейчас 0.00375 — почти незаметная, только лёгкий намёк.")]
+    public float shakeIntensity = 0.00375f;      
+
+    [Tooltip("Усиливает тряску при беге. 1.5–2.0 — заметно, но не раздражает.")]
+    public float runShakeMultiplier = 1.8f;   
+
+    private const float shakeSpeed = 25f;     // частота дрожания
+    private float shakeTimer = 0f;            // таймер для плавного движения точки тряски
+    private Vector3 shakeOffset = Vector3.zero;  // текущее смещение
+
+    private float targetShake = 0f;          // целевая сила тряски
+    private float currentShake = 0f;          // сглаженная сила тряски
+    private const float shakeSmooth = 18f;    // максимально плавное затухание
+
+    private Vector3 originalCamOffset;  
+
+    void Start()
+    {
+        view = GetComponent<PhotonView>();
+        if (nick != null) nick.text = "Игрок";
+        
+        numPanels = 0;
+        currentSpeed = baseSpeed;
+        
+        if (cam != null)
+            originalCamOffset = cam.transform.localPosition;
+    }
+
+    void Update()
+    {
+        if (view.IsMine == true)
+        {
+            cam.gameObject.SetActive(true);
+            Canvas.gameObject.SetActive(true);
+        }
+
+        if (view.IsMine)
+        {
+            Cursor.lockState = CursorLockMode.Locked;
+            
+            HandleSpeed();
+            Move();
+            
+            SpawnObject(); 
+            DestroyObject(); 
+            Inventory();
+            TorchSetActive();
+            esc_menu();
+        }
+    }
+
+    void HandleSpeed()
+    {
+        if (Input.GetKey(KeyCode.LeftShift))
+        {
+            currentSpeed = runSpeed;
+        }
+        else
+        {
+            currentSpeed = baseSpeed;
+        }
+    }
+
+    private void Move()
+    {
+        CharacterController controller = GetComponent<CharacterController>();
+        if (controller == null)
+        {
+            Debug.LogError("[Move_Player] На персонаже нет CharacterController! Добавь его.");
+            return;
+        }
+
+        float x = Input.GetAxis("Horizontal");
+        float z = Input.GetAxis("Vertical");
+        
+        Vector3 move = transform.right * x + transform.forward * z;
+        move *= currentSpeed;
+
+        if (controller.isGrounded)
+        {
+            if (Input.GetKey(KeyCode.Space))
+            {
+                moveDirection.y = jumpSpeed;
+            }
+            else
+            {
+                moveDirection.y = 0f;
+            }
+        }
+        
+        moveDirection.y -= gravity * Time.deltaTime;
+
+        controller.Move((move + moveDirection) * Time.deltaTime);
+
+        bool isMoving = (move.magnitude > 0.1f);
+        ApplyCameraShake(isMoving);
+    }
+
+    void ApplyCameraShake(bool isMoving)
+    {
+        if (cam == null) return;
+
+        // Целевая сила тряски: 0 если стоим, иначе shakeIntensity (+ множитель при беге)
+        float baseShake = shakeIntensity;
+        if (Input.GetKey(KeyCode.LeftShift) && isMoving)
+        {
+            baseShake *= runShakeMultiplier;
+        }
+
+        targetShake = isMoving ? baseShake : 0f;
+
+        // Максимально плавное изменение силы тряски
+        currentShake = Mathf.Lerp(currentShake, targetShake, Time.deltaTime * shakeSmooth);
+
+        // Если тряски почти нет — ставим камеру ровно
+        if (currentShake < 0.0001f)
+        {
+            cam.transform.localPosition = originalCamOffset;
+            shakeOffset = Vector3.zero;
+            return;
+        }
+
+        // Плавное «дрожание» по синусам
+        shakeTimer += Time.deltaTime * shakeSpeed;
+        float sX = Mathf.Sin(shakeTimer) * currentShake;
+        float sY = Mathf.Cos(shakeTimer * 1.3f) * currentShake * 0.6f;
+        float sZ = Mathf.Sin(shakeTimer * 0.7f) * currentShake * 0.4f;
+
+        shakeOffset = new Vector3(sX, sY, sZ);
+
+        cam.transform.localPosition = originalCamOffset + shakeOffset;
+    }
+
+    public void SpawnObject()
+    {
+        if (Input.GetKeyUp(KeyCode.Mouse1))
+        {
+            spawnRay = cam.ScreenPointToRay(Input.mousePosition);
+
+            if (Physics.Raycast(spawnRay, out hit, 10.0f))
+            {
+                if (numPanels == 9) return;
+
+                if (hit.transform.tag == "floor")
+                {
+                    PhotonNetwork.Instantiate(blocks[numPanels].name, hit.point, Quaternion.identity);
+                    PlaySound(0);
+                }
+                else if (hit.transform.gameObject.name == "Trigger Y")
+                {
+                    hit.point = hit.transform.position + new Vector3(0, 0.459f, 0);
+                    PhotonNetwork.Instantiate(blocks[numPanels].name, hit.point, Quaternion.identity);
+                    PlaySound(0);
+                }
+                else if (hit.transform.gameObject.name == "Trigger -Y") 
+                {
+                    hit.point = hit.transform.position + new Vector3(0, -0.459f, 0);
+                    PhotonNetwork.Instantiate(blocks[numPanels].name, hit.point, Quaternion.identity);
+                    PlaySound(0);
+                }
+                else if (hit.transform.gameObject.name == "Trigger X")
+                {
+                    hit.point = hit.transform.position + new Vector3(0.459f, 0, 0);
+                    PhotonNetwork.Instantiate(blocks[numPanels].name, hit.point, Quaternion.identity);
+                    PlaySound(0);
+                }
+                else if (hit.transform.gameObject.name == "Trigger -X")
+                {
+                    hit.point = hit.transform.position + new Vector3(-0.459f, 0, 0);
+                    PhotonNetwork.Instantiate(blocks[numPanels].name, hit.point, Quaternion.identity);
+                    PlaySound(0);
+                }
+                else if (hit.transform.gameObject.name == "Trigger Z")
+                {
+                    hit.point = hit.transform.position + new Vector3(0, 0, 0.459f);
+                    PhotonNetwork.Instantiate(blocks[numPanels].name, hit.point, Quaternion.identity);
+                    PlaySound(0);
+                }
+                else if (hit.transform.gameObject.name == "Trigger -Z")
+                {
+                    hit.point = hit.transform.position + new Vector3(0, 0, -0.459f);
+                    PhotonNetwork.Instantiate(blocks[numPanels].name, hit.point, Quaternion.identity);
+                    PlaySound(0);
+                }
+            }
+        }
+    }
+
+    public void DestroyObject()
+    {
+        if (isBreaking && targetToBreak != null)
+        {
+            breakTimer += Time.deltaTime;
+
+            if (Time.time >= nextSoundTime)
+            {
+                PlaySound(2); 
+                nextSoundTime = Time.time + breakSoundInterval;
+            }
+
+            if (breakTimer >= breakTime)
+            {
+                PhotonView targetPV = targetToBreak.GetComponent<PhotonView>();
+                if (targetPV != null)
+                {
+                    PhotonNetwork.Destroy(targetPV.gameObject);
+                }
+                PlaySound(1); 
+
+                isBreaking = false;
+                targetToBreak = null;
+                breakTimer = 0f;
+                nextSoundTime = 0f;
+            }
+            return;
+        }
+
+        if (Input.GetKeyDown(KeyCode.Mouse0))
+        {
+            spawnRay = cam.ScreenPointToRay(Input.mousePosition);
+
+            if (Physics.Raycast(spawnRay, out hit, 10.0f))
+            {
+                GameObject candidate = null;
+
+                if (hit.transform.CompareTag("trigger"))
+                {
+                    candidate = hit.transform.parent.gameObject;
+                }
+                else if (hit.transform.CompareTag("Block"))
+                {
+                    candidate = hit.transform.gameObject;
+                }
+
+                if (candidate != null)
+                {
+                    isBreaking = true;
+                    targetToBreak = candidate;
+                    breakTimer = 0f;
+                    nextSoundTime = Time.time + breakSoundInterval;
+                }
+            }
+        }
+        else if (Input.GetKeyUp(KeyCode.Mouse0))
+        {
+            isBreaking = false;
+            targetToBreak = null;
+            breakTimer = 0f;
+            nextSoundTime = 0f;
+        }
+    }
+
+    void PlaySound(int index)
+    {
+        if (music != null && sound != null && index < sound.Length)
+        {
+            music.clip = sound[index];
+            music.Play();
+        }
+    }
+
+    public void Inventory()
+    {
+        if (Input.GetKeyDown(KeyCode.Alpha1)) SetPanel(0);
+        else if (Input.GetKeyDown(KeyCode.Alpha2)) SetPanel(1);
+        else if (Input.GetKeyDown(KeyCode.Alpha3)) SetPanel(2);
+        else if (Input.GetKeyDown(KeyCode.Alpha4)) SetPanel(3);
+        else if (Input.GetKeyDown(KeyCode.Alpha5)) SetPanel(4);
+        else if (Input.GetKeyDown(KeyCode.Alpha6)) SetPanel(5);
+        else if (Input.GetKeyDown(KeyCode.Alpha7)) SetPanel(6);
+        else if (Input.GetKeyDown(KeyCode.Alpha8)) SetPanel(7);
+    }
+
+    void SetPanel(int index)
+    {
+        if (index < 0 || index > 8) return;
+
+        if (numPanels >= 0 && numPanels < cellPanels.Length)
+            cellPanels[numPanels].GetComponent<Image>().color = Color.gray;
+
+        numPanels = index;
+
+        if (numPanels >= 0 && numPanels < cellPanels.Length)
+            cellPanels[numPanels].GetComponent<Image>().color = Color.white;
+    }
+
+    public void TorchSetActive()
+    {
+        if (numPanels == 9)
+        {
+            Torch.SetActive(true);
+        }
+        else
+        {
+            Torch.SetActive(false);
+        }
+    }
+
+    public void esc_menu()
+    {
+        if (Input.GetKeyUp(KeyCode.Escape))
+        {
+            Cursor.lockState = CursorLockMode.Confined;
+            PhotonNetwork.Disconnect();
+            PhotonNetwork.LoadLevel("LoadingScene");
+        }
+    }
+}
