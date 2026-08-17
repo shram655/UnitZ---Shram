@@ -1,0 +1,317 @@
+using UnityEngine;
+using Photon.Pun;
+using System.Collections;
+using System.Collections.Generic;
+
+[System.Serializable]
+public class WeaponData
+{
+    public int weaponId;
+    public string weaponName;
+    public int damage;
+    public float fireRate;
+    public float range;
+    public float spread;
+    public int maxAmmo;
+    public float reloadTime;
+    public float recoilAmount;
+    public float recoilRecovery;
+    public ParticleSystem muzzleFlash;
+    public GameObject impactEffect;
+    public AudioClip shootSound;
+    public AudioClip reloadSound;
+    public AudioClip emptySound;
+}
+
+public class PlayerWeaponManager : MonoBehaviourPun
+{
+    [Header("Настройки оружия")]
+    public Transform weaponSlot;
+    public Transform thirdPersonWeaponSlot;
+    public float pickupRange = 3f;
+    public GameObject gunPrefab;
+
+    [Header("Регистрация оружий")]
+    public List<WeaponData> weaponRegistry = new List<WeaponData>();
+
+    private Gun currentGun;
+    private Gun thirdPersonGun;
+    private int equippedSlotIndex = -1;
+    private int equippedWeaponId = -1;
+
+    public bool HasWeaponEquipped => currentGun != null;
+    public int EquippedSlotIndex => equippedSlotIndex;
+
+    private PlayerController playerController;
+    private PlayerInventory playerInventory;
+
+    void Awake()
+    {
+        playerController = GetComponent<PlayerController>();
+        playerInventory = GetComponent<PlayerInventory>();
+    }
+
+    void Update()
+    {
+        if (!photonView.IsMine || playerController.isPlayerDead || playerInventory.IsInventoryOpen) return;
+        if (Input.GetKeyDown(KeyCode.E)) PickupWeaponFromGround();
+        if (Input.GetKeyDown(KeyCode.G)) DropWeapon();
+    }
+
+    public WeaponData GetWeaponData(int weaponId)
+    {
+        foreach (var wd in weaponRegistry)
+        {
+            if (wd.weaponId == weaponId) return wd;
+        }
+        return null;
+    }
+
+    public void RegisterWeaponData(WeaponData data)
+    {
+        if (GetWeaponData(data.weaponId) != null) return;
+        weaponRegistry.Add(data);
+        Debug.Log($"📝 Зарегистрировано оружие #{data.weaponId}: {data.weaponName}");
+    }
+
+    public void EquipWeaponFromSlot(int slotIndex)
+    {
+        if (slotIndex < 0 || slotIndex >= playerInventory.inventory.Length) return;
+
+        int itemId = playerInventory.inventory[slotIndex];
+        if (itemId >= -2) return;
+
+        int weaponId = -(itemId + 100);
+        WeaponData data = GetWeaponData(weaponId);
+
+        if (equippedSlotIndex == slotIndex && currentGun != null)
+        {
+            currentGun.Equip();
+            if (thirdPersonGun != null) thirdPersonGun.Show();
+            return;
+        }
+
+        UnequipCurrentWeapon();
+        CreateAndEquipWeapon(slotIndex, weaponId, data);
+    }
+
+    public void UnequipCurrentWeapon()
+    {
+        if (currentGun == null && thirdPersonGun == null) return;
+
+        if (currentGun != null) currentGun.Unequip();
+        if (thirdPersonGun != null) thirdPersonGun.Hide();
+
+        equippedSlotIndex = -1;
+        equippedWeaponId = -1;
+    }
+
+    private void DestroyGuns()
+    {
+        if (currentGun != null)
+        {
+            if (PhotonNetwork.IsConnected) PhotonNetwork.Destroy(currentGun.gameObject);
+            else Destroy(currentGun.gameObject);
+            currentGun = null;
+        }
+
+        if (thirdPersonGun != null)
+        {
+            if (PhotonNetwork.IsConnected) PhotonNetwork.Destroy(thirdPersonGun.gameObject);
+            else Destroy(thirdPersonGun.gameObject);
+            thirdPersonGun = null;
+        }
+
+        equippedSlotIndex = -1;
+        equippedWeaponId = -1;
+    }
+
+    void CreateAndEquipWeapon(int slotIndex, int weaponId, WeaponData data)
+    {
+        if (weaponSlot == null || gunPrefab == null) return;
+
+        GameObject gunObj = PhotonNetwork.Instantiate(gunPrefab.name, weaponSlot.position, weaponSlot.rotation);
+        gunObj.transform.SetParent(weaponSlot);
+        gunObj.transform.localPosition = new Vector3(0.3f, -0.3f, 0.5f);
+        gunObj.transform.localRotation = Quaternion.identity;
+        gunObj.transform.localScale = Vector3.one;
+
+        currentGun = gunObj.GetComponent<Gun>();
+        if (currentGun == null)
+        {
+            PhotonNetwork.Destroy(gunObj);
+            return;
+        }
+
+        if (data != null) ApplyWeaponData(currentGun, data);
+
+        currentGun.fpsCam = playerController.playerCamera;
+        currentGun.playerInventory = playerInventory;
+        currentGun.weaponId = weaponId;
+        currentGun.slotIndex = slotIndex;
+
+        Transform barrelEnd = gunObj.transform.Find("BarrelEnd");
+        if (barrelEnd == null)
+        {
+            GameObject barrelObj = new GameObject("BarrelEnd");
+            barrelObj.transform.SetParent(gunObj.transform);
+            barrelObj.transform.localPosition = new Vector3(0, 0, 0.5f);
+            barrelEnd = barrelObj.transform;
+        }
+        currentGun.barrelEnd = barrelEnd;
+
+        if (thirdPersonWeaponSlot != null)
+        {
+            GameObject thirdPersonGunObj = PhotonNetwork.Instantiate(gunPrefab.name, thirdPersonWeaponSlot.position, thirdPersonWeaponSlot.rotation);
+            thirdPersonGunObj.transform.SetParent(thirdPersonWeaponSlot);
+            thirdPersonGunObj.transform.localPosition = Vector3.zero;
+            thirdPersonGunObj.transform.localRotation = Quaternion.identity;
+            thirdPersonGunObj.transform.localScale = Vector3.one;
+
+            thirdPersonGun = thirdPersonGunObj.GetComponent<Gun>();
+            if (thirdPersonGun != null)
+            {
+                if (data != null) ApplyWeaponData(thirdPersonGun, data);
+                thirdPersonGun.fpsCam = null;
+                thirdPersonGun.playerInventory = playerInventory;
+                thirdPersonGun.weaponId = weaponId;
+                thirdPersonGun.slotIndex = slotIndex;
+            }
+        }
+
+        equippedSlotIndex = slotIndex;
+        equippedWeaponId = weaponId;
+
+        StartCoroutine(DelayedEquip(currentGun));
+    }
+
+    private void ApplyWeaponData(Gun gun, WeaponData data)
+    {
+        gun.weaponName = string.IsNullOrEmpty(data.weaponName) ? "Оружие" : data.weaponName;
+        gun.damage = data.damage > 0 ? data.damage : 25f;
+        gun.fireRate = data.fireRate > 0.01f ? data.fireRate : 0.1f;
+        gun.range = data.range > 0 ? data.range : 100f;
+        gun.spread = data.spread > 0 ? data.spread : 0.02f;
+        gun.maxAmmo = data.maxAmmo > 0 ? data.maxAmmo : 30;
+        gun.reloadTime = data.reloadTime > 0 ? data.reloadTime : 2f;
+        gun.recoilAmount = data.recoilAmount > 0 ? data.recoilAmount : 0.5f;
+        gun.recoilRecovery = data.recoilRecovery > 0 ? data.recoilRecovery : 5f;
+
+        if (data.muzzleFlash != null) gun.muzzleFlash = data.muzzleFlash;
+        if (data.impactEffect != null) gun.impactEffect = data.impactEffect;
+        if (data.shootSound != null) gun.shootSound = data.shootSound;
+        if (data.reloadSound != null) gun.reloadSound = data.reloadSound;
+        if (data.emptySound != null) gun.emptySound = data.emptySound;
+    }
+
+    IEnumerator DelayedEquip(Gun gun)
+    {
+        yield return new WaitForSeconds(0.2f);
+        gun.Equip();
+    }
+
+    public void AddWeaponToInventory(int weaponId, WeaponData data)
+    {
+        if (data == null) return;
+
+        RegisterWeaponData(data);
+
+        int freeSlot = -1;
+        for (int i = 0; i < 15; i++) { if (playerInventory.inventory[i] == 0) { freeSlot = i; break; } }
+        if (freeSlot == -1) { for (int i = 15; i < 20; i++) { if (playerInventory.inventory[i] == 0) { freeSlot = i; break; } } }
+        if (freeSlot == -1) { Debug.LogWarning("⚠️ Нет места для оружия!"); return; }
+
+        int inventoryId = -(100 + weaponId);
+        playerInventory.inventory[freeSlot] = inventoryId;
+        playerInventory.inventoryCounts[freeSlot] = data.maxAmmo;
+
+        playerInventory.UpdateHotbarUI();
+        if (playerInventory.inventoryUI != null) playerInventory.inventoryUI.UpdateAllSlots();
+
+        Debug.Log($"🔫 Добавлено оружие #{weaponId} ({data.weaponName}) в слот {freeSlot}");
+    }
+
+    void PickupWeaponFromGround()
+    {
+        Collider[] colliders = Physics.OverlapSphere(transform.position, pickupRange);
+        foreach (Collider col in colliders)
+        {
+            PickupWeapon pickup = col.GetComponent<PickupWeapon>();
+            if (pickup != null)
+            {
+                pickup.PickUp(gameObject);
+                return;
+            }
+        }
+    }
+
+    // ══════════════════════════════════════════════════════
+    //  🆕 ИСПРАВЛЕНО: индекс слота сохраняется ДО DestroyGuns(),
+    //  иначе inventory[-1] = исключение и слот не очищался
+    // ══════════════════════════════════════════════════════
+    void DropWeapon()
+    {
+        if (equippedSlotIndex < 0)
+        {
+            Debug.Log("⚠️ DropWeapon: нет экипированного оружия");
+            return;
+        }
+
+        if (equippedSlotIndex >= playerInventory.inventory.Length)
+        {
+            Debug.LogError("❌ DropWeapon: некорректный equippedSlotIndex");
+            return;
+        }
+
+        // 🆕 ЗАПОМИНАЕМ слот ДО уничтожения оружия
+        int slotToClear = equippedSlotIndex;
+
+        int itemId = playerInventory.inventory[slotToClear];
+        if (itemId >= -2)
+        {
+            Debug.Log("⚠️ DropWeapon: в слоте не оружие");
+            return;
+        }
+
+        int weaponId = -(itemId + 100);
+        WeaponData data = GetWeaponData(weaponId);
+        int magAmmo = playerInventory.inventoryCounts[slotToClear];
+
+        Debug.Log($"🗑️ Выбрасываю оружие #{weaponId} ({(data != null ? data.weaponName : "?")}), магазин: {magAmmo}");
+
+        // Уничтожаем оружие (сбрасывает equippedSlotIndex в -1)
+        DestroyGuns();
+
+        // Создаём оружие на земле
+        Vector3 dropPosition = transform.position + transform.forward * 3f;
+        dropPosition.y = transform.position.y + 2f;
+
+        PickupWeapon.DropWeapon(dropPosition, Quaternion.identity,
+            data != null ? data.weaponName : "Оружие",
+            data != null ? data.damage : 25,
+            data != null ? data.fireRate : 0.1f,
+            data != null ? data.range : 100f,
+            data != null ? data.spread : 0.02f,
+            data != null ? data.maxAmmo : 30,
+            data != null ? data.reloadTime : 2f,
+            data != null ? data.recoilAmount : 0.5f,
+            data != null ? data.recoilRecovery : 5f,
+            data != null ? data.muzzleFlash : null,
+            data != null ? data.impactEffect : null,
+            data != null ? data.shootSound : null,
+            data != null ? data.reloadSound : null,
+            data != null ? data.emptySound : null,
+            null,
+            weaponId,
+            magAmmo);
+
+        // 🆕 Очищаем слот по СОХРАНЁННОМУ индексу
+        playerInventory.inventory[slotToClear] = 0;
+        playerInventory.inventoryCounts[slotToClear] = 0;
+
+        playerInventory.UpdateHotbarUI();
+        if (playerInventory.inventoryUI != null) playerInventory.inventoryUI.UpdateAllSlots();
+
+        Debug.Log($"✅ Оружие выброшено, слот {slotToClear} очищен");
+    }
+}
